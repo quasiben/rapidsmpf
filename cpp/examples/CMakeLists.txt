@@ -58,3 +58,4 @@ if(RAPIDSMPF_HAVE_CUPTI)
     EXCLUDE_FROM_ALL
   )
 endif()
+
