@@ -56,12 +56,14 @@ rapidsmpf::streaming::Node PhysicalProjection::BuildNode(
               std::vector<duckdb::idx_t> col_indices) 
         -> rapidsmpf::streaming::Node {
         
-        rapidsmpf::streaming::ShutdownAtExit shutdown_guard(output);
+        rapidsmpf::streaming::ShutdownAtExit shutdown_guard{input, output};
         std::uint64_t seq = 0;
         
         while (true) {
             auto msg = co_await input->receive();
             if (msg.empty()) break;
+            
+            co_await ctx->executor()->schedule();
             
             auto chunk = std::make_unique<rapidsmpf::streaming::TableChunk>(
                 msg.release<rapidsmpf::streaming::TableChunk>()
@@ -79,7 +81,7 @@ rapidsmpf::streaming::Node PhysicalProjection::BuildNode(
             
             auto tbl_view = chunk->table_view();
             auto stream = chunk->stream();
-            auto* mr = rmm::mr::get_current_device_resource();
+            auto mr = ctx->br()->device_mr();
             
             // Select only the requested columns
             if (!col_indices.empty()) {
@@ -110,6 +112,8 @@ rapidsmpf::streaming::Node PhysicalProjection::BuildNode(
                 co_await output->send(rapidsmpf::streaming::to_message(seq++, std::move(chunk)));
             }
         }
+        
+        co_await output->drain(ctx->executor());
     }(ctx, ch_in, ch_out, std::move(indices));
 }
 

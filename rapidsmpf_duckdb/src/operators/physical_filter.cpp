@@ -21,10 +21,12 @@
 
 #include <rapidsmpf/streaming/cudf/table_chunk.hpp>
 
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 namespace rapidsmpf_duckdb {
 
@@ -76,13 +78,115 @@ class AstExpressionConverter {
             case duckdb::ExpressionType::BOUND_COLUMN_REF:
                 return ConvertColumnRef(expr);
 
+            case duckdb::ExpressionType::BOUND_REF:
+                return ConvertBoundRef(expr);
+
             case duckdb::ExpressionType::VALUE_CONSTANT:
                 return ConvertConstant(expr);
+
+            case duckdb::ExpressionType::OPERATOR_CAST:
+                return ConvertCast(expr);
 
             default:
                 throw std::runtime_error(
                     "Unsupported expression type in filter: " + 
                     duckdb::ExpressionTypeToString(expr.type)
+                );
+        }
+    }
+
+    cudf::ast::expression* ConvertCast(duckdb::Expression& expr) {
+        // For CAST, we need to handle the target type appropriately
+        // cudf AST doesn't have explicit cast nodes, so we need to create 
+        // properly typed literals when the child is a constant
+        auto& cast_expr = expr.Cast<duckdb::BoundCastExpression>();
+        auto target_type = cast_expr.return_type;
+        
+        // If the child is a constant, create a literal with the target type
+        if (cast_expr.child->type == duckdb::ExpressionType::VALUE_CONSTANT) {
+            auto& constant = cast_expr.child->Cast<duckdb::BoundConstantExpression>();
+            
+            // Get the value and manually cast it to the target type
+            auto value = constant.value.DefaultCastAs(target_type);
+            return ConvertConstantValue(value);
+        }
+        
+        // For column references or complex expressions, just pass through
+        // cudf will handle type matching at runtime
+        return ConvertImpl(*cast_expr.child);
+    }
+    
+    cudf::ast::expression* ConvertConstantValue(duckdb::Value& value) {
+        switch (value.type().id()) {
+            case duckdb::LogicalTypeId::BOOLEAN: {
+                auto scalar = std::make_unique<cudf::numeric_scalar<bool>>(
+                    value.GetValue<bool>(), true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::TINYINT: {
+                auto scalar = std::make_unique<cudf::numeric_scalar<int8_t>>(
+                    value.GetValue<int8_t>(), true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::SMALLINT: {
+                auto scalar = std::make_unique<cudf::numeric_scalar<int16_t>>(
+                    value.GetValue<int16_t>(), true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::INTEGER: {
+                auto scalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
+                    value.GetValue<int32_t>(), true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::BIGINT: {
+                auto scalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
+                    value.GetValue<int64_t>(), true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::FLOAT: {
+                auto scalar = std::make_unique<cudf::numeric_scalar<float>>(
+                    value.GetValue<float>(), true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::DOUBLE: {
+                auto scalar = std::make_unique<cudf::numeric_scalar<double>>(
+                    value.GetValue<double>(), true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::DECIMAL: {
+                auto dbl_val = value.GetValue<double>();
+                auto scalar = std::make_unique<cudf::numeric_scalar<double>>(
+                    dbl_val, true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            default:
+                throw std::runtime_error(
+                    "Unsupported constant type in filter: " + 
+                    value.type().ToString()
                 );
         }
     }
@@ -154,84 +258,19 @@ class AstExpressionConverter {
         return column_refs_.back().get();
     }
 
+    cudf::ast::expression* ConvertBoundRef(duckdb::Expression& expr) {
+        auto& ref = expr.Cast<duckdb::BoundReferenceExpression>();
+        
+        // Use the reference index
+        auto col_idx = static_cast<cudf::size_type>(ref.index);
+        column_refs_.push_back(std::make_unique<cudf::ast::column_reference>(col_idx));
+        return column_refs_.back().get();
+    }
+
     cudf::ast::expression* ConvertConstant(duckdb::Expression& expr) {
         auto& constant = expr.Cast<duckdb::BoundConstantExpression>();
-        auto& value = constant.value;
-        
-        switch (value.type().id()) {
-            case duckdb::LogicalTypeId::BOOLEAN: {
-                auto scalar = std::make_unique<cudf::numeric_scalar<bool>>(
-                    value.GetValue<bool>(), true, stream_, mr_
-                );
-                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
-                scalars_.push_back(std::move(scalar));
-                return literals_.back().get();
-            }
-            case duckdb::LogicalTypeId::TINYINT: {
-                auto scalar = std::make_unique<cudf::numeric_scalar<int8_t>>(
-                    value.GetValue<int8_t>(), true, stream_, mr_
-                );
-                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
-                scalars_.push_back(std::move(scalar));
-                return literals_.back().get();
-            }
-            case duckdb::LogicalTypeId::SMALLINT: {
-                auto scalar = std::make_unique<cudf::numeric_scalar<int16_t>>(
-                    value.GetValue<int16_t>(), true, stream_, mr_
-                );
-                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
-                scalars_.push_back(std::move(scalar));
-                return literals_.back().get();
-            }
-            case duckdb::LogicalTypeId::INTEGER: {
-                auto scalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
-                    value.GetValue<int32_t>(), true, stream_, mr_
-                );
-                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
-                scalars_.push_back(std::move(scalar));
-                return literals_.back().get();
-            }
-            case duckdb::LogicalTypeId::BIGINT: {
-                auto scalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
-                    value.GetValue<int64_t>(), true, stream_, mr_
-                );
-                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
-                scalars_.push_back(std::move(scalar));
-                return literals_.back().get();
-            }
-            case duckdb::LogicalTypeId::FLOAT: {
-                auto scalar = std::make_unique<cudf::numeric_scalar<float>>(
-                    value.GetValue<float>(), true, stream_, mr_
-                );
-                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
-                scalars_.push_back(std::move(scalar));
-                return literals_.back().get();
-            }
-            case duckdb::LogicalTypeId::DOUBLE: {
-                auto scalar = std::make_unique<cudf::numeric_scalar<double>>(
-                    value.GetValue<double>(), true, stream_, mr_
-                );
-                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
-                scalars_.push_back(std::move(scalar));
-                return literals_.back().get();
-            }
-            case duckdb::LogicalTypeId::DECIMAL: {
-                // Convert decimal to double for now
-                // TODO: Use proper decimal support
-                auto dbl_val = value.GetValue<double>();
-                auto scalar = std::make_unique<cudf::numeric_scalar<double>>(
-                    dbl_val, true, stream_, mr_
-                );
-                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
-                scalars_.push_back(std::move(scalar));
-                return literals_.back().get();
-            }
-            default:
-                throw std::runtime_error(
-                    "Unsupported constant type in filter: " + 
-                    value.type().ToString()
-                );
-        }
+        auto value = constant.value;  // Copy so we can modify if needed
+        return ConvertConstantValue(value);
     }
 };
 
@@ -265,12 +304,15 @@ rapidsmpf::streaming::Node PhysicalFilter::BuildNode(
               duckdb::unique_ptr<duckdb::Expression> filter_expr) 
         -> rapidsmpf::streaming::Node {
         
-        rapidsmpf::streaming::ShutdownAtExit shutdown_guard(output);
+        // Shutdown both channels on exit (like Q9's filter_part pattern)
+        rapidsmpf::streaming::ShutdownAtExit shutdown_guard{input, output};
         std::uint64_t seq = 0;
         
         while (true) {
             auto msg = co_await input->receive();
             if (msg.empty()) break;
+            
+            co_await ctx->executor()->schedule();
             
             // Get the table chunk
             auto chunk = std::make_unique<rapidsmpf::streaming::TableChunk>(
@@ -317,6 +359,9 @@ rapidsmpf::streaming::Node PhysicalFilter::BuildNode(
             
             co_await output->send(rapidsmpf::streaming::to_message(seq++, std::move(filtered_chunk)));
         }
+        
+        // Drain the output channel before exiting
+        co_await output->drain(ctx->executor());
     }(ctx, ch_in, ch_out, std::move(expr_copy));
 }
 

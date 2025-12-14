@@ -24,3 +24,8 @@ add_executable(benchmark_gpu_vs_cpu benchmark_gpu_vs_cpu.cpp)
 target_link_libraries(benchmark_gpu_vs_cpu ${EXAMPLE_LIBS})
 target_include_directories(benchmark_gpu_vs_cpu PRIVATE ${EXAMPLE_INCLUDES})
 
+# Test: GPU Filter execution test
+add_executable(test_gpu_filter test_gpu_filter.cpp)
+target_link_libraries(test_gpu_filter ${EXAMPLE_LIBS})
+target_include_directories(test_gpu_filter PRIVATE ${EXAMPLE_INCLUDES})
+

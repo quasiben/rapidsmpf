@@ -36,9 +36,15 @@ PhysicalTableScan::PhysicalTableScan(duckdb::LogicalGet& get)
         table_name_ = get.GetName();
     }
     
-    // Get column names from the LogicalGet - these correspond to projected columns
-    for (auto const& name : get.names) {
-        column_names_.push_back(name);
+    // Get column names for the columns actually projected by the scan
+    // The column_ids tell us which underlying table columns are needed
+    // We use the column_ids to get the correct column names
+    auto const& column_ids = get.GetColumnIds();
+    for (size_t i = 0; i < column_ids.size(); i++) {
+        auto col_idx = column_ids[i].GetPrimaryIndex();
+        if (col_idx < get.names.size()) {
+            column_names_.push_back(get.names[col_idx]);
+        }
     }
     
     // Look up file paths from the table registry

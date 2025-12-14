@@ -9,7 +9,9 @@
 #include <cudf/aggregation.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
 
 // Undefine DEBUG to avoid conflict with DuckDB's -DDEBUG flag and rapidsmpf's LOG_LEVEL::DEBUG
 #ifdef DEBUG
@@ -107,7 +109,7 @@ rapidsmpf::streaming::Node PhysicalAggregate::BuildNode(
               std::vector<AggInfo> aggs)
         -> rapidsmpf::streaming::Node {
         
-        rapidsmpf::streaming::ShutdownAtExit shutdown_guard(output);
+        rapidsmpf::streaming::ShutdownAtExit shutdown_guard{input, output};
         
         // Accumulators for streaming aggregation
         std::vector<double> sums(aggs.size(), 0.0);
@@ -119,6 +121,8 @@ rapidsmpf::streaming::Node PhysicalAggregate::BuildNode(
         while (true) {
             auto msg = co_await input->receive();
             if (msg.empty()) break;
+            
+            co_await ctx->executor()->schedule();
             
             auto chunk = std::make_unique<rapidsmpf::streaming::TableChunk>(
                 msg.release<rapidsmpf::streaming::TableChunk>()
@@ -136,7 +140,7 @@ rapidsmpf::streaming::Node PhysicalAggregate::BuildNode(
             
             auto tbl_view = chunk->table_view();
             auto stream = chunk->stream();
-            auto* mr = rmm::mr::get_current_device_resource();
+            auto mr = ctx->br()->device_mr();
             
             // For each aggregation, update the running totals
             for (size_t i = 0; i < aggs.size(); i++) {
@@ -149,7 +153,7 @@ rapidsmpf::streaming::Node PhysicalAggregate::BuildNode(
                     
                     // Compute the aggregation for this chunk
                     auto agg_obj = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
-                    auto result = cudf::reduce(col, *agg_obj, col.type(), stream, mr);
+                    auto result = cudf::reduce(col, *agg_obj, col.type(), stream, ctx->br()->device_mr());
                     
                     // For now, assume numeric type and add to sum
                     // TODO: Handle different aggregation types properly
@@ -160,7 +164,7 @@ rapidsmpf::streaming::Node PhysicalAggregate::BuildNode(
                             
                             // Also track min/max
                             auto min_agg = cudf::make_min_aggregation<cudf::reduce_aggregation>();
-                            auto min_result = cudf::reduce(col, *min_agg, col.type(), stream, mr);
+                            auto min_result = cudf::reduce(col, *min_agg, col.type(), stream, ctx->br()->device_mr());
                             if (auto* min_scalar = dynamic_cast<cudf::numeric_scalar<double>*>(min_result.get())) {
                                 if (min_scalar->is_valid()) {
                                     mins[i] = std::min(mins[i], min_scalar->value());
@@ -168,7 +172,7 @@ rapidsmpf::streaming::Node PhysicalAggregate::BuildNode(
                             }
                             
                             auto max_agg = cudf::make_max_aggregation<cudf::reduce_aggregation>();
-                            auto max_result = cudf::reduce(col, *max_agg, col.type(), stream, mr);
+                            auto max_result = cudf::reduce(col, *max_agg, col.type(), stream, ctx->br()->device_mr());
                             if (auto* max_scalar = dynamic_cast<cudf::numeric_scalar<double>*>(max_result.get())) {
                                 if (max_scalar->is_valid()) {
                                     maxs[i] = std::max(maxs[i], max_scalar->value());
@@ -183,7 +187,7 @@ rapidsmpf::streaming::Node PhysicalAggregate::BuildNode(
         // Build the final result
         std::vector<std::unique_ptr<cudf::column>> result_columns;
         rmm::cuda_stream_view stream = rmm::cuda_stream_default;
-        auto* mr = rmm::mr::get_current_device_resource();
+        auto mr = ctx->br()->device_mr();
         
         for (size_t i = 0; i < aggs.size(); i++) {
             auto const& agg = aggs[i];
@@ -209,18 +213,13 @@ rapidsmpf::streaming::Node PhysicalAggregate::BuildNode(
                     throw std::runtime_error("Unsupported aggregation kind");
             }
             
-            // Create a column with the single result value
-            auto col = cudf::make_numeric_column(
-                cudf::data_type{cudf::type_id::FLOAT64},
-                1,
-                cudf::mask_state::UNALLOCATED,
-                stream,
-                mr
-            );
+            // Create a scalar with the result value
+            auto scalar = cudf::make_numeric_scalar(cudf::data_type{cudf::type_id::FLOAT64}, stream, mr);
+            static_cast<cudf::numeric_scalar<double>*>(scalar.get())->set_value(value, stream);
+            static_cast<cudf::numeric_scalar<double>*>(scalar.get())->set_valid_async(true, stream);
             
-            // Set the value
-            cudf::numeric_scalar<double> scalar(value, true, stream, mr);
-            // TODO: Actually set the column value from the scalar
+            // Create a single-row column from the scalar using cudf::make_column_from_scalar
+            auto col = cudf::make_column_from_scalar(*scalar, 1, stream, mr);
             
             result_columns.push_back(std::move(col));
         }
@@ -233,6 +232,7 @@ rapidsmpf::streaming::Node PhysicalAggregate::BuildNode(
         );
         
         co_await output->send(rapidsmpf::streaming::to_message(0, std::move(result_chunk)));
+        co_await output->drain(ctx->executor());
     }(ctx, ch_in, ch_out, std::move(agg_infos));
 }
 
