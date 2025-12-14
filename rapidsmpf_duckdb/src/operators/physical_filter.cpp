@@ -5,8 +5,14 @@
 
 #include "../include/operators/physical_filter.hpp"
 
-#include <cudf/copying.hpp>
+#include <memory>
+#include <vector>
+
 #include <cudf/ast/expressions.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/stream_compaction.hpp>
+#include <cudf/transform.hpp>
 
 // Undefine DEBUG to avoid conflict with DuckDB's -DDEBUG flag and rapidsmpf's LOG_LEVEL::DEBUG
 #ifdef DEBUG
@@ -15,7 +21,219 @@
 
 #include <rapidsmpf/streaming/cudf/table_chunk.hpp>
 
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+
 namespace rapidsmpf_duckdb {
+
+/**
+ * @brief Helper class to convert DuckDB expressions to cudf AST expressions.
+ * 
+ * Manages the lifetime of all intermediate objects (scalars, column references,
+ * literals, operations) needed to build the cudf AST expression tree.
+ */
+class AstExpressionConverter {
+  public:
+    explicit AstExpressionConverter(rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+        : stream_(stream), mr_(mr) {}
+
+    /**
+     * @brief Convert a DuckDB expression to a cudf AST expression.
+     * 
+     * @param expr The DuckDB expression to convert.
+     * @return Reference to the root cudf AST expression.
+     */
+    cudf::ast::expression& Convert(duckdb::Expression& expr) {
+        return *ConvertImpl(expr);
+    }
+
+  private:
+    rmm::cuda_stream_view stream_;
+    rmm::device_async_resource_ref mr_;
+    
+    // Storage for owned objects - keeps them alive as long as the converter exists
+    std::vector<std::unique_ptr<cudf::scalar>> scalars_;
+    std::vector<std::unique_ptr<cudf::ast::literal>> literals_;
+    std::vector<std::unique_ptr<cudf::ast::column_reference>> column_refs_;
+    std::vector<std::unique_ptr<cudf::ast::operation>> operations_;
+
+    cudf::ast::expression* ConvertImpl(duckdb::Expression& expr) {
+        switch (expr.type) {
+            case duckdb::ExpressionType::COMPARE_EQUAL:
+            case duckdb::ExpressionType::COMPARE_NOTEQUAL:
+            case duckdb::ExpressionType::COMPARE_LESSTHAN:
+            case duckdb::ExpressionType::COMPARE_GREATERTHAN:
+            case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+            case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+                return ConvertComparison(expr);
+
+            case duckdb::ExpressionType::CONJUNCTION_AND:
+            case duckdb::ExpressionType::CONJUNCTION_OR:
+                return ConvertConjunction(expr);
+
+            case duckdb::ExpressionType::BOUND_COLUMN_REF:
+                return ConvertColumnRef(expr);
+
+            case duckdb::ExpressionType::VALUE_CONSTANT:
+                return ConvertConstant(expr);
+
+            default:
+                throw std::runtime_error(
+                    "Unsupported expression type in filter: " + 
+                    duckdb::ExpressionTypeToString(expr.type)
+                );
+        }
+    }
+
+    cudf::ast::expression* ConvertComparison(duckdb::Expression& expr) {
+        auto& comp = expr.Cast<duckdb::BoundComparisonExpression>();
+        
+        auto* left = ConvertImpl(*comp.left);
+        auto* right = ConvertImpl(*comp.right);
+        
+        cudf::ast::ast_operator op;
+        switch (expr.type) {
+            case duckdb::ExpressionType::COMPARE_EQUAL:
+                op = cudf::ast::ast_operator::EQUAL;
+                break;
+            case duckdb::ExpressionType::COMPARE_NOTEQUAL:
+                op = cudf::ast::ast_operator::NOT_EQUAL;
+                break;
+            case duckdb::ExpressionType::COMPARE_LESSTHAN:
+                op = cudf::ast::ast_operator::LESS;
+                break;
+            case duckdb::ExpressionType::COMPARE_GREATERTHAN:
+                op = cudf::ast::ast_operator::GREATER;
+                break;
+            case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+                op = cudf::ast::ast_operator::LESS_EQUAL;
+                break;
+            case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+                op = cudf::ast::ast_operator::GREATER_EQUAL;
+                break;
+            default:
+                throw std::runtime_error("Unexpected comparison type");
+        }
+        
+        operations_.push_back(std::make_unique<cudf::ast::operation>(op, *left, *right));
+        return operations_.back().get();
+    }
+
+    cudf::ast::expression* ConvertConjunction(duckdb::Expression& expr) {
+        auto& conj = expr.Cast<duckdb::BoundConjunctionExpression>();
+        
+        if (conj.children.empty()) {
+            throw std::runtime_error("Empty conjunction expression");
+        }
+        
+        // Convert first child
+        auto* result = ConvertImpl(*conj.children[0]);
+        
+        // Chain the rest with AND or OR
+        cudf::ast::ast_operator op = (expr.type == duckdb::ExpressionType::CONJUNCTION_AND)
+            ? cudf::ast::ast_operator::BITWISE_AND  // AND for boolean
+            : cudf::ast::ast_operator::BITWISE_OR;  // OR for boolean
+        
+        for (size_t i = 1; i < conj.children.size(); i++) {
+            auto* child = ConvertImpl(*conj.children[i]);
+            operations_.push_back(std::make_unique<cudf::ast::operation>(op, *result, *child));
+            result = operations_.back().get();
+        }
+        
+        return result;
+    }
+
+    cudf::ast::expression* ConvertColumnRef(duckdb::Expression& expr) {
+        auto& colref = expr.Cast<duckdb::BoundColumnRefExpression>();
+        
+        // Use column index from the binding
+        auto col_idx = static_cast<cudf::size_type>(colref.binding.column_index);
+        column_refs_.push_back(std::make_unique<cudf::ast::column_reference>(col_idx));
+        return column_refs_.back().get();
+    }
+
+    cudf::ast::expression* ConvertConstant(duckdb::Expression& expr) {
+        auto& constant = expr.Cast<duckdb::BoundConstantExpression>();
+        auto& value = constant.value;
+        
+        switch (value.type().id()) {
+            case duckdb::LogicalTypeId::BOOLEAN: {
+                auto scalar = std::make_unique<cudf::numeric_scalar<bool>>(
+                    value.GetValue<bool>(), true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::TINYINT: {
+                auto scalar = std::make_unique<cudf::numeric_scalar<int8_t>>(
+                    value.GetValue<int8_t>(), true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::SMALLINT: {
+                auto scalar = std::make_unique<cudf::numeric_scalar<int16_t>>(
+                    value.GetValue<int16_t>(), true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::INTEGER: {
+                auto scalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
+                    value.GetValue<int32_t>(), true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::BIGINT: {
+                auto scalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
+                    value.GetValue<int64_t>(), true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::FLOAT: {
+                auto scalar = std::make_unique<cudf::numeric_scalar<float>>(
+                    value.GetValue<float>(), true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::DOUBLE: {
+                auto scalar = std::make_unique<cudf::numeric_scalar<double>>(
+                    value.GetValue<double>(), true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::DECIMAL: {
+                // Convert decimal to double for now
+                // TODO: Use proper decimal support
+                auto dbl_val = value.GetValue<double>();
+                auto scalar = std::make_unique<cudf::numeric_scalar<double>>(
+                    dbl_val, true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            default:
+                throw std::runtime_error(
+                    "Unsupported constant type in filter: " + 
+                    value.type().ToString()
+                );
+        }
+    }
+};
 
 PhysicalFilter::PhysicalFilter(
     duckdb::LogicalFilter& filter,
@@ -33,44 +251,18 @@ PhysicalFilter::PhysicalFilter(
     AddChild(std::move(child));
 }
 
-/**
- * @brief Convert a DuckDB expression to a cudf AST expression.
- * 
- * This is a simplified converter for common filter expressions.
- * TODO: Implement full expression conversion.
- */
-static std::unique_ptr<cudf::ast::expression> ConvertExpression(
-    duckdb::Expression& expr,
-    std::vector<std::unique_ptr<cudf::ast::literal>>& literals
-) {
-    // TODO: Implement expression conversion from DuckDB to cudf AST
-    // This would handle:
-    // - ComparisonExpression (=, <, >, <=, >=, !=)
-    // - ConjunctionExpression (AND, OR)
-    // - BoundColumnRefExpression (column references)
-    // - ConstantExpression (literals)
-    throw std::runtime_error(
-        "Expression conversion from DuckDB to cudf AST is not yet implemented. "
-        "Filter pushdown is stubbed out for future implementation."
-    );
-}
-
 rapidsmpf::streaming::Node PhysicalFilter::BuildNode(
     std::shared_ptr<rapidsmpf::streaming::Context> ctx,
     std::shared_ptr<rapidsmpf::streaming::Channel> ch_in,
     std::shared_ptr<rapidsmpf::streaming::Channel> ch_out
 ) {
-    // Create a filter node that:
-    // 1. Receives TableChunks from ch_in
-    // 2. Applies the filter predicate
-    // 3. Sends filtered results to ch_out
-    
-    // For now, we create a simple pass-through node as a placeholder
-    // TODO: Implement proper filter expression evaluation
+    // Capture a copy of the expression for the coroutine
+    auto expr_copy = expression_->Copy();
     
     return [](std::shared_ptr<rapidsmpf::streaming::Context> ctx,
               std::shared_ptr<rapidsmpf::streaming::Channel> input,
-              std::shared_ptr<rapidsmpf::streaming::Channel> output) 
+              std::shared_ptr<rapidsmpf::streaming::Channel> output,
+              duckdb::unique_ptr<duckdb::Expression> filter_expr) 
         -> rapidsmpf::streaming::Node {
         
         rapidsmpf::streaming::ShutdownAtExit shutdown_guard(output);
@@ -95,16 +287,37 @@ rapidsmpf::streaming::Node PhysicalFilter::BuildNode(
                 *chunk = chunk->make_available(reservation);
             }
             
-            // TODO: Apply the filter expression here
-            // For now, pass through unchanged
-            // cudf::ast::compute_column would be used here
+            auto tbl_view = chunk->table_view();
+            auto stream = chunk->stream();
+            auto mr = ctx->br()->device_mr();
             
-            co_await output->send(rapidsmpf::streaming::to_message(seq++, std::move(chunk)));
+            // Skip empty chunks
+            if (tbl_view.num_rows() == 0) {
+                co_await output->send(rapidsmpf::streaming::to_message(seq++, std::move(chunk)));
+                continue;
+            }
+            
+            // Convert the DuckDB expression to cudf AST
+            AstExpressionConverter converter(stream, mr);
+            auto& ast_expr = converter.Convert(*filter_expr);
+            
+            // Compute the boolean mask using cudf::compute_column
+            auto mask_column = cudf::compute_column(tbl_view, ast_expr, stream, mr);
+            
+            // Apply the boolean mask to filter rows
+            auto filtered_table = cudf::apply_boolean_mask(
+                tbl_view, mask_column->view(), stream, mr
+            );
+            
+            // Create a new chunk with the filtered data
+            auto filtered_chunk = std::make_unique<rapidsmpf::streaming::TableChunk>(
+                std::move(filtered_table),
+                stream
+            );
+            
+            co_await output->send(rapidsmpf::streaming::to_message(seq++, std::move(filtered_chunk)));
         }
-    }(ctx, ch_in, ch_out);
+    }(ctx, ch_in, ch_out, std::move(expr_copy));
 }
 
 }  // namespace rapidsmpf_duckdb
-
-
-
