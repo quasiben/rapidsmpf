@@ -1,0 +1,4 @@
+ 15-12-2025 08:41:34:988 [pid=2472743 tid=2472880] NOTICE  cufio-drv:855 running in compatible mode
+ 15-12-2025 08:41:38:470 [pid=2472743 tid=2472880] ERROR  cufio-fs:79 mount option not found in mount table data device: /dev/md0
+ 15-12-2025 08:43:27:759 [pid=2477897 tid=2478072] NOTICE  cufio-drv:855 running in compatible mode
+ 15-12-2025 08:43:30:461 [pid=2477897 tid=2478072] ERROR  cufio-fs:79 mount option not found in mount table data device: /dev/md0
