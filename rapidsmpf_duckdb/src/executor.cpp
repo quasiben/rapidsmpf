@@ -34,7 +34,7 @@ Executor::Executor() {
     
     // Create environment configuration
     std::unordered_map<std::string, std::string> environment;
-    environment["NUM_STREAMING_THREADS"] = "1";  // Single thread for now
+    environment["NUM_STREAMING_THREADS"] = "4";  // Single thread for now
     auto options = rapidsmpf::config::Options(environment);
     
     // Create communicator for single-process execution

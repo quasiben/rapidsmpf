@@ -13,6 +13,9 @@
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
+#include <cudf/strings/strings_column_view.hpp>
+
+#include <cuda/std/chrono>
 
 // Undefine DEBUG to avoid conflict with DuckDB's -DDEBUG flag and rapidsmpf's LOG_LEVEL::DEBUG
 #ifdef DEBUG
@@ -178,6 +181,45 @@ class AstExpressionConverter {
                 auto dbl_val = value.GetValue<double>();
                 auto scalar = std::make_unique<cudf::numeric_scalar<double>>(
                     dbl_val, true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::VARCHAR: {
+                // String literal - create a cudf::string_scalar
+                auto str_val = value.GetValue<std::string>();
+                auto scalar = std::make_unique<cudf::string_scalar>(
+                    str_val, true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::DATE: {
+                // Date literal - convert to cudf::timestamp_scalar<timestamp_D>
+                // DuckDB stores dates as days since epoch
+                auto date_val = value.GetValue<duckdb::date_t>();
+                auto days_since_epoch = date_val.days;
+                
+                // Create a timestamp scalar with day precision
+                using timestamp_type = cudf::timestamp_D;
+                auto scalar = std::make_unique<cudf::timestamp_scalar<timestamp_type>>(
+                    timestamp_type::duration{days_since_epoch}, true, stream_, mr_
+                );
+                literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                scalars_.push_back(std::move(scalar));
+                return literals_.back().get();
+            }
+            case duckdb::LogicalTypeId::TIMESTAMP:
+            case duckdb::LogicalTypeId::TIMESTAMP_TZ: {
+                // Timestamp literal - convert to cudf::timestamp_scalar<timestamp_us>
+                // DuckDB stores timestamps as microseconds since epoch
+                auto ts_val = value.GetValue<duckdb::timestamp_t>();
+                
+                using timestamp_type = cudf::timestamp_us;
+                auto scalar = std::make_unique<cudf::timestamp_scalar<timestamp_type>>(
+                    timestamp_type::duration{ts_val.value}, true, stream_, mr_
                 );
                 literals_.push_back(std::make_unique<cudf::ast::literal>(*scalar));
                 scalars_.push_back(std::move(scalar));

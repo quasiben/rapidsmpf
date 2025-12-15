@@ -8,6 +8,8 @@
 #include "include/operators/physical_filter.hpp"
 #include "include/operators/physical_projection.hpp"
 #include "include/operators/physical_aggregate.hpp"
+#include "include/operators/physical_limit.hpp"
+#include "include/operators/physical_order.hpp"
 
 namespace rapidsmpf_duckdb {
 
@@ -38,11 +40,17 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(
         case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
             return CreatePlan(op.Cast<duckdb::LogicalAggregate>());
 
+        case duckdb::LogicalOperatorType::LOGICAL_LIMIT:
+            return CreatePlan(op.Cast<duckdb::LogicalLimit>());
+
+        case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY:
+            return CreatePlan(op.Cast<duckdb::LogicalOrder>());
+
         default:
             throw std::runtime_error(
                 "Unsupported logical operator type: " +
                 duckdb::LogicalOperatorToString(op.type) +
-                ". Currently supported: GET (table scan), FILTER, PROJECTION, AGGREGATE."
+                ". Currently supported: GET, FILTER, PROJECTION, AGGREGATE, LIMIT, ORDER BY."
             );
     }
 }
@@ -84,6 +92,28 @@ std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(
     }
     auto child = CreatePlan(*op.children[0]);
     return std::make_unique<PhysicalAggregate>(op, std::move(child));
+}
+
+std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(
+    duckdb::LogicalLimit& op
+) {
+    // Recursively create the child plan first
+    if (op.children.empty()) {
+        throw std::runtime_error("LogicalLimit has no child operator");
+    }
+    auto child = CreatePlan(*op.children[0]);
+    return std::make_unique<PhysicalLimit>(op, std::move(child));
+}
+
+std::unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(
+    duckdb::LogicalOrder& op
+) {
+    // Recursively create the child plan first
+    if (op.children.empty()) {
+        throw std::runtime_error("LogicalOrder has no child operator");
+    }
+    auto child = CreatePlan(*op.children[0]);
+    return std::make_unique<PhysicalOrder>(op, std::move(child));
 }
 
 }  // namespace rapidsmpf_duckdb

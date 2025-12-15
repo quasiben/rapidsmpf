@@ -13,6 +13,8 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
+#include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/main/client_context.hpp"
 
 #include "physical_operator.hpp"
@@ -72,9 +74,16 @@ class PhysicalPlanGenerator {
     [[nodiscard]] std::unique_ptr<PhysicalOperator> CreatePlan(
         duckdb::LogicalAggregate& op
     );
+    [[nodiscard]] std::unique_ptr<PhysicalOperator> CreatePlan(
+        duckdb::LogicalLimit& op
+    );
+    [[nodiscard]] std::unique_ptr<PhysicalOperator> CreatePlan(
+        duckdb::LogicalOrder& op
+    );
 };
 
 }  // namespace rapidsmpf_duckdb
+
 
 
 

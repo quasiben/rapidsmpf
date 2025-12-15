@@ -52,6 +52,8 @@ set(EXTENSION_SOURCES
   src/operators/physical_projection.cpp
   src/operators/physical_filter.cpp
   src/operators/physical_aggregate.cpp
+  src/operators/physical_limit.cpp
+  src/operators/physical_order.cpp
 )
 
 # Build the extension using DuckDB's extension build system

@@ -29,3 +29,8 @@ add_executable(test_gpu_filter test_gpu_filter.cpp)
 target_link_libraries(test_gpu_filter ${EXAMPLE_LIBS})
 target_include_directories(test_gpu_filter PRIVATE ${EXAMPLE_INCLUDES})
 
+# Test: New operators (string, date, order, limit)
+add_executable(test_new_operators test_new_operators.cpp)
+target_link_libraries(test_new_operators ${EXAMPLE_LIBS})
+target_include_directories(test_new_operators PRIVATE ${EXAMPLE_INCLUDES})
+
