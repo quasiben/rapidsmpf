@@ -129,6 +129,9 @@ target_link_libraries(example_from_json PRIVATE rapidsmpf_substrait)
 add_executable(test_gpu_execution examples/test_gpu_execution.cpp)
 target_link_libraries(test_gpu_execution PRIVATE rapidsmpf_substrait)
 
+add_executable(tpch_query examples/tpch_query.cpp)
+target_link_libraries(tpch_query PRIVATE rapidsmpf_substrait)
+
 # =============================================================================
 # Installation
 # =============================================================================

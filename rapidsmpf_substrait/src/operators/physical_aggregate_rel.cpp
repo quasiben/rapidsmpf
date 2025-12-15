@@ -49,20 +49,6 @@ PhysicalAggregateRel::PhysicalAggregateRel(
     children_.push_back(std::move(child));
 }
 
-// Map to reduce aggregation
-static std::unique_ptr<cudf::reduce_aggregation> MapReduceAggregation(std::string const& name) {
-    if (name == "sum" || name == "add") {
-        return cudf::make_sum_aggregation<cudf::reduce_aggregation>();
-    } else if (name == "avg" || name == "mean") {
-        return cudf::make_mean_aggregation<cudf::reduce_aggregation>();
-    } else if (name == "min") {
-        return cudf::make_min_aggregation<cudf::reduce_aggregation>();
-    } else if (name == "max") {
-        return cudf::make_max_aggregation<cudf::reduce_aggregation>();
-    }
-    return nullptr;
-}
-
 rapidsmpf::streaming::Node PhysicalAggregateRel::BuildNode(
     std::shared_ptr<rapidsmpf::streaming::Context> ctx,
     std::shared_ptr<rapidsmpf::streaming::Channel> ch_in,
@@ -82,6 +68,7 @@ rapidsmpf::streaming::Node PhysicalAggregateRel::BuildNode(
             rapidsmpf::streaming::ShutdownAtExit shutdown_guard(output);
 
             // Accumulators for streaming aggregation
+            // For AVG: we need sum and count, then divide at end
             std::vector<double> sums(aggregates.size(), 0.0);
             std::vector<int64_t> counts(aggregates.size(), 0);
             std::vector<double> mins(aggregates.size(), std::numeric_limits<double>::max());
@@ -125,23 +112,42 @@ rapidsmpf::streaming::Node PhysicalAggregateRel::BuildNode(
                         auto col_idx = agg.argument_indices[0];
                         if (col_idx >= 0 && col_idx < table_view.num_columns()) {
                             auto const& col = table_view.column(col_idx);
+                            int64_t valid_count = col.size() - col.null_count();
                             
-                            // Use cudf::reduce for the aggregation
-                            auto reduce_agg = MapReduceAggregation(agg.function_name);
-                            if (reduce_agg) {
-                                auto result = cudf::reduce(col, *reduce_agg, cudf::data_type{cudf::type_id::FLOAT64}, last_stream, last_mr);
+                            if (agg.function_name == "sum" || agg.function_name == "add") {
+                                // Use SUM aggregation
+                                auto sum_agg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+                                auto result = cudf::reduce(col, *sum_agg, cudf::data_type{cudf::type_id::FLOAT64}, last_stream, last_mr);
                                 auto* scalar = static_cast<cudf::numeric_scalar<double>*>(result.get());
                                 if (scalar->is_valid()) {
-                                    double val = scalar->value(last_stream);
-                                    if (agg.function_name == "min") {
-                                        mins[i] = std::min(mins[i], val);
-                                    } else if (agg.function_name == "max") {
-                                        maxs[i] = std::max(maxs[i], val);
-                                    } else {
-                                        sums[i] += val;
-                                    }
+                                    sums[i] += scalar->value(last_stream);
                                 }
-                                counts[i] += col.size() - col.null_count();
+                                counts[i] += valid_count;
+                            } else if (agg.function_name == "avg" || agg.function_name == "mean") {
+                                // For AVG: accumulate SUM and COUNT, divide at end
+                                auto sum_agg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+                                auto result = cudf::reduce(col, *sum_agg, cudf::data_type{cudf::type_id::FLOAT64}, last_stream, last_mr);
+                                auto* scalar = static_cast<cudf::numeric_scalar<double>*>(result.get());
+                                if (scalar->is_valid()) {
+                                    sums[i] += scalar->value(last_stream);
+                                }
+                                counts[i] += valid_count;
+                            } else if (agg.function_name == "min") {
+                                auto min_agg = cudf::make_min_aggregation<cudf::reduce_aggregation>();
+                                auto result = cudf::reduce(col, *min_agg, cudf::data_type{cudf::type_id::FLOAT64}, last_stream, last_mr);
+                                auto* scalar = static_cast<cudf::numeric_scalar<double>*>(result.get());
+                                if (scalar->is_valid()) {
+                                    mins[i] = std::min(mins[i], scalar->value(last_stream));
+                                }
+                                counts[i] += valid_count;
+                            } else if (agg.function_name == "max") {
+                                auto max_agg = cudf::make_max_aggregation<cudf::reduce_aggregation>();
+                                auto result = cudf::reduce(col, *max_agg, cudf::data_type{cudf::type_id::FLOAT64}, last_stream, last_mr);
+                                auto* scalar = static_cast<cudf::numeric_scalar<double>*>(result.get());
+                                if (scalar->is_valid()) {
+                                    maxs[i] = std::max(maxs[i], scalar->value(last_stream));
+                                }
+                                counts[i] += valid_count;
                             }
                         }
                     }
@@ -160,6 +166,7 @@ rapidsmpf::streaming::Node PhysicalAggregateRel::BuildNode(
                 } else if (agg.function_name == "sum" || agg.function_name == "add") {
                     value = sums[i];
                 } else if (agg.function_name == "avg" || agg.function_name == "mean") {
+                    // Proper average: total sum / total count
                     value = counts[i] > 0 ? sums[i] / static_cast<double>(counts[i]) : 0.0;
                 } else if (agg.function_name == "min") {
                     value = mins[i];

@@ -15,6 +15,7 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/transform.hpp>
+#include <cudf/scalar/scalar.hpp>
 
 #include <rapidsmpf/streaming/core/node.hpp>
 #include <rapidsmpf/streaming/cudf/table_chunk.hpp>
@@ -33,79 +34,111 @@ PhysicalFilterRel::PhysicalFilterRel(
     children_.push_back(std::move(child));
 }
 
-// Helper to build a cudf AST expression from our ExpressionInfo
-static std::unique_ptr<cudf::ast::operation> BuildAstExpression(
-    ExpressionInfo const& expr,
-    std::vector<std::unique_ptr<cudf::ast::literal>>& literals
-) {
-    if (expr.type == ExpressionInfo::Type::SCALAR_FUNCTION) {
-        // Map function names to AST operators
-        cudf::ast::ast_operator op;
-        
-        if (expr.function_name == "equal" || expr.function_name == "eq") {
-            op = cudf::ast::ast_operator::EQUAL;
-        } else if (expr.function_name == "not_equal" || expr.function_name == "ne") {
-            op = cudf::ast::ast_operator::NOT_EQUAL;
-        } else if (expr.function_name == "lt" || expr.function_name == "less_than") {
-            op = cudf::ast::ast_operator::LESS;
-        } else if (expr.function_name == "lte" || expr.function_name == "less_than_or_equal") {
-            op = cudf::ast::ast_operator::LESS_EQUAL;
-        } else if (expr.function_name == "gt" || expr.function_name == "greater_than") {
-            op = cudf::ast::ast_operator::GREATER;
-        } else if (expr.function_name == "gte" || expr.function_name == "greater_than_or_equal") {
-            op = cudf::ast::ast_operator::GREATER_EQUAL;
-        } else if (expr.function_name == "and") {
-            op = cudf::ast::ast_operator::LOGICAL_AND;
-        } else if (expr.function_name == "or") {
-            op = cudf::ast::ast_operator::LOGICAL_OR;
-        } else {
-            // For unsupported functions, return nullptr
-            return nullptr;
-        }
+// Storage structure to keep AST objects alive
+struct AstContext {
+    std::vector<std::unique_ptr<cudf::scalar>> scalars;
+    std::vector<std::unique_ptr<cudf::ast::literal>> literals;
+    std::vector<std::unique_ptr<cudf::ast::column_reference>> column_refs;
+    std::unique_ptr<cudf::ast::operation> root_op;
+    
+    cudf::ast::expression* build(
+        ExpressionInfo const& expr,
+        rmm::cuda_stream_view stream,
+        rmm::device_async_resource_ref mr
+    ) {
+        if (expr.type == ExpressionInfo::Type::SCALAR_FUNCTION) {
+            // Map function names to AST operators
+            cudf::ast::ast_operator op;
+            
+            if (expr.function_name == "equal" || expr.function_name == "eq") {
+                op = cudf::ast::ast_operator::EQUAL;
+            } else if (expr.function_name == "not_equal" || expr.function_name == "ne") {
+                op = cudf::ast::ast_operator::NOT_EQUAL;
+            } else if (expr.function_name == "lt" || expr.function_name == "less_than") {
+                op = cudf::ast::ast_operator::LESS;
+            } else if (expr.function_name == "lte" || expr.function_name == "less_than_or_equal") {
+                op = cudf::ast::ast_operator::LESS_EQUAL;
+            } else if (expr.function_name == "gt" || expr.function_name == "greater_than") {
+                op = cudf::ast::ast_operator::GREATER;
+            } else if (expr.function_name == "gte" || expr.function_name == "greater_than_or_equal") {
+                op = cudf::ast::ast_operator::GREATER_EQUAL;
+            } else if (expr.function_name == "and") {
+                op = cudf::ast::ast_operator::LOGICAL_AND;
+            } else if (expr.function_name == "or") {
+                op = cudf::ast::ast_operator::LOGICAL_OR;
+            } else {
+                return nullptr;
+            }
 
-        // Build operands (simplified: only handle binary operations with column and literal)
-        if (expr.arguments.size() == 2) {
-            auto const& left = expr.arguments[0];
-            auto const& right = expr.arguments[1];
+            // Handle binary operations: column op literal
+            if (expr.arguments.size() == 2) {
+                auto const& left = expr.arguments[0];
+                auto const& right = expr.arguments[1];
 
-            // Case: column op literal
-            if (left.type == ExpressionInfo::Type::FIELD_REFERENCE &&
-                right.type == ExpressionInfo::Type::LITERAL) {
-                
-                auto col_ref = cudf::ast::column_reference(left.field_index);
-                
-                // Create literal based on type
-                std::unique_ptr<cudf::ast::literal> lit;
-                switch (right.output_type.id()) {
-                    case cudf::type_id::INT32: {
-                        auto scalar = cudf::numeric_scalar<int32_t>(std::stoi(right.literal_value));
-                        literals.push_back(std::make_unique<cudf::ast::literal>(scalar));
-                        lit = std::move(literals.back());
-                        break;
+                if (left.type == ExpressionInfo::Type::FIELD_REFERENCE &&
+                    right.type == ExpressionInfo::Type::LITERAL) {
+                    
+                    // Create column reference and keep it alive
+                    column_refs.push_back(
+                        std::make_unique<cudf::ast::column_reference>(left.field_index)
+                    );
+                    auto* col_ref = column_refs.back().get();
+                    
+                    // Create scalar and literal based on type, keep both alive
+                    cudf::ast::literal* lit_ptr = nullptr;
+                    
+                    switch (right.output_type.id()) {
+                        case cudf::type_id::INT32: {
+                            auto scalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
+                                std::stoi(right.literal_value), true, stream, mr
+                            );
+                            literals.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                            scalars.push_back(std::move(scalar));
+                            lit_ptr = literals.back().get();
+                            break;
+                        }
+                        case cudf::type_id::INT64: {
+                            auto scalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
+                                std::stoll(right.literal_value), true, stream, mr
+                            );
+                            literals.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                            scalars.push_back(std::move(scalar));
+                            lit_ptr = literals.back().get();
+                            break;
+                        }
+                        case cudf::type_id::FLOAT32: {
+                            auto scalar = std::make_unique<cudf::numeric_scalar<float>>(
+                                std::stof(right.literal_value), true, stream, mr
+                            );
+                            literals.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                            scalars.push_back(std::move(scalar));
+                            lit_ptr = literals.back().get();
+                            break;
+                        }
+                        case cudf::type_id::FLOAT64: {
+                            auto scalar = std::make_unique<cudf::numeric_scalar<double>>(
+                                std::stod(right.literal_value), true, stream, mr
+                            );
+                            literals.push_back(std::make_unique<cudf::ast::literal>(*scalar));
+                            scalars.push_back(std::move(scalar));
+                            lit_ptr = literals.back().get();
+                            break;
+                        }
+                        default:
+                            return nullptr;
                     }
-                    case cudf::type_id::INT64: {
-                        auto scalar = cudf::numeric_scalar<int64_t>(std::stoll(right.literal_value));
-                        literals.push_back(std::make_unique<cudf::ast::literal>(scalar));
-                        lit = std::move(literals.back());
-                        break;
+                    
+                    if (lit_ptr) {
+                        root_op = std::make_unique<cudf::ast::operation>(op, *col_ref, *lit_ptr);
+                        return root_op.get();
                     }
-                    case cudf::type_id::FLOAT64: {
-                        auto scalar = cudf::numeric_scalar<double>(std::stod(right.literal_value));
-                        literals.push_back(std::make_unique<cudf::ast::literal>(scalar));
-                        lit = std::move(literals.back());
-                        break;
-                    }
-                    default:
-                        return nullptr;
                 }
-                
-                return std::make_unique<cudf::ast::operation>(op, col_ref, *literals.back());
             }
         }
+        
+        return nullptr;
     }
-    
-    return nullptr;
-}
+};
 
 rapidsmpf::streaming::Node PhysicalFilterRel::BuildNode(
     std::shared_ptr<rapidsmpf::streaming::Context> ctx,
@@ -149,9 +182,9 @@ rapidsmpf::streaming::Node PhysicalFilterRel::BuildNode(
             auto stream = chunk->stream();
             auto mr = ctx->br()->device_mr();
             
-            // Try to build and apply AST filter
-            std::vector<std::unique_ptr<cudf::ast::literal>> literals;
-            auto ast_expr = BuildAstExpression(condition, literals);
+            // Build AST expression with proper lifetime management
+            AstContext ast_ctx;
+            auto* ast_expr = ast_ctx.build(condition, stream, mr);
             
             std::unique_ptr<cudf::table> filtered_table;
             if (ast_expr) {
