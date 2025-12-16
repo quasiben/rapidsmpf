@@ -565,12 +565,55 @@ chunk = chunk.make_available(reservation);  // Move data to GPU
 
 ---
 
+## Supported Operations
+
+| Category | Operation | Status | Notes |
+|----------|-----------|--------|-------|
+| **Table Scan** | Parquet reading | ✅ Supported | Uses `rapidsmpf::streaming::node::read_parquet` |
+| **Projection** | Column selection | ✅ Supported | Selects columns from input |
+| **Filter** | Numeric comparisons (`=`, `!=`, `<`, `>`, `<=`, `>=`) | ✅ Supported | Converted to cudf AST |
+| **Filter** | String equality (`=`, `!=`) | ✅ Supported | Uses cudf string comparison |
+| **Filter** | Date comparisons | ✅ Supported | Dates converted to days-since-epoch |
+| **Filter** | Conjunctions (`AND`, `OR`) | ✅ Supported | Nested AST operations |
+| **Filter** | CAST expressions | ✅ Supported | Handled transparently |
+| **Aggregate** | `COUNT(*)` | ✅ Supported | Row counting |
+| **Aggregate** | `SUM` | ✅ Supported | Uses `cudf::reduce` |
+| **Aggregate** | `AVG` / `MEAN` | ✅ Supported | Streaming sum/count |
+| **Aggregate** | `MIN` / `MAX` | ✅ Supported | Uses `cudf::reduce` |
+| **ORDER BY** | Single/multi-column sorting | ✅ Supported | Uses `cudf::sort_by_key` |
+| **ORDER BY** | ASC/DESC | ✅ Supported | Configurable per column |
+| **ORDER BY** | NULLS FIRST/LAST | ✅ Supported | Configurable per column |
+| **LIMIT** | Row limiting | ✅ Supported | Uses `cudf::slice` |
+| **LIMIT** | OFFSET | ✅ Supported | Offset + limit |
+
+---
+
+## Unsupported Operations
+
+| Category | Operation | Status | Notes |
+|----------|-----------|--------|-------|
+| **Projection** | Arithmetic expressions (`*`, `-`, `+`, `/`) | ❌ Not implemented | Needed for computed columns |
+| **Aggregate** | `GROUP BY` | ❌ Not implemented | Only ungrouped aggregation supported |
+| **Join** | Hash join | ❌ Not implemented | Required for multi-table queries |
+| **Join** | Merge join | ❌ Not implemented | Alternative join strategy |
+| **Filter** | `LIKE` / `ILIKE` | ❌ Not implemented | String pattern matching |
+| **Filter** | `IN` / `NOT IN` | ❌ Not implemented | Set membership |
+| **Filter** | `BETWEEN` | ❌ Not implemented | Range check |
+| **Filter** | `IS NULL` / `IS NOT NULL` | ❌ Not implemented | Null checks |
+| **Subquery** | Scalar subqueries | ❌ Not implemented | |
+| **Subquery** | EXISTS / NOT EXISTS | ❌ Not implemented | |
+| **Window** | Window functions | ❌ Not implemented | `ROW_NUMBER`, `RANK`, etc. |
+| **Set** | UNION / INTERSECT / EXCEPT | ❌ Not implemented | |
+| **Result** | cudf → DuckDB conversion | ❌ Not implemented | Results stay on GPU |
+
+---
+
 ## Future Work
 
-1. **Filter pushdown**: Convert DuckDB expressions to cudf AST for GPU-accelerated filtering
-2. **Result conversion**: Implement cudf → Arrow → DuckDB DataChunk conversion
-3. **Parallel parquet reading**: Use multiple producers for faster I/O
-4. **JOIN support**: Implement hash join and merge join operators
-5. **ORDER BY / LIMIT**: Implement sorting and limit operators
-6. **GROUP BY**: Extend aggregation to support grouped operations
+1. **Arithmetic expressions**: Add `*`, `-`, `+`, `/` support in projections for computed columns
+2. **GROUP BY aggregation**: Extend aggregate to support grouped operations using `cudf::groupby`
+3. **JOIN support**: Implement hash join using `cudf::hash_join` or `rapidsmpf` shuffle
+4. **Result conversion**: Implement cudf → Arrow → DuckDB DataChunk conversion
+5. **Parallel parquet reading**: Use multiple producers for faster I/O
+6. **String patterns**: Add `LIKE`/`ILIKE` support using `cudf::strings::contains`
 

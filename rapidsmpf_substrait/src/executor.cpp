@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 
@@ -28,13 +29,41 @@
 
 namespace rapidsmpf_substrait {
 
+// Helper to get integer from environment variable with default
+static int get_env_int(const char* name, int default_value) {
+    const char* val = std::getenv(name);
+    if (val) {
+        try {
+            return std::stoi(val);
+        } catch (...) {
+            return default_value;
+        }
+    }
+    return default_value;
+}
+
 Executor::Executor() {
     // Get the current device memory resource
     auto* current_mr = rmm::mr::get_current_device_resource();
 
+    // Read configuration from environment variables
+    int num_streaming_threads = get_env_int("NUM_STREAMING_THREADS", 4);
+    int num_streams = get_env_int("NUM_STREAMS", 16);
+    
+    // Print configuration
+    std::cout << "Executor configuration:" << std::endl;
+    std::cout << "  NUM_STREAMING_THREADS: " << num_streaming_threads << std::endl;
+    std::cout << "  NUM_STREAMS: " << num_streams << std::endl;
+    
+    // Check for other relevant env vars
+    const char* kvikio = std::getenv("KVIKIO_NTHREADS");
+    const char* cudf_workers = std::getenv("LIBCUDF_NUM_HOST_WORKERS");
+    if (kvikio) std::cout << "  KVIKIO_NTHREADS: " << kvikio << std::endl;
+    if (cudf_workers) std::cout << "  LIBCUDF_NUM_HOST_WORKERS: " << cudf_workers << std::endl;
+
     // Create environment configuration
     std::unordered_map<std::string, std::string> environment;
-    environment["NUM_STREAMING_THREADS"] = "4";
+    environment["NUM_STREAMING_THREADS"] = std::to_string(num_streaming_threads);
     auto options = rapidsmpf::config::Options(environment);
 
     // Create communicator for single-process execution
@@ -46,8 +75,8 @@ Executor::Executor() {
     // Create statistics
     statistics_ = std::make_shared<rapidsmpf::Statistics>(mr_adaptor_.get());
 
-    // Create stream pool
-    stream_pool_ = std::make_shared<rmm::cuda_stream_pool>(4);
+    // Create stream pool with configurable size
+    stream_pool_ = std::make_shared<rmm::cuda_stream_pool>(num_streams);
 
     // Create buffer resource
     br_ = std::make_shared<rapidsmpf::BufferResource>(
@@ -67,8 +96,10 @@ Executor::Executor(
     std::shared_ptr<rapidsmpf::Communicator> comm,
     std::shared_ptr<rapidsmpf::BufferResource> br
 ) : comm_(std::move(comm)), br_(std::move(br)) {
+    int num_streaming_threads = get_env_int("NUM_STREAMING_THREADS", 4);
+    
     std::unordered_map<std::string, std::string> environment;
-    environment["NUM_STREAMING_THREADS"] = "4";
+    environment["NUM_STREAMING_THREADS"] = std::to_string(num_streaming_threads);
     auto options = rapidsmpf::config::Options(environment);
 
     auto statistics = rapidsmpf::Statistics::disabled();
